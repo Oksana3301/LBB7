@@ -1,0 +1,640 @@
+---
+author: "Atika Dewi Suryani"
+date: "`r format(Sys.Date(), '%B %e, %Y')`"
+title: "Survive Before Go to Sea~"
+html_document:
+  code_folding : hide
+  toc: yes
+  toc_float:
+    collapsed: yes
+  number_sections: false
+  toc_depth: 3
+  theme: flatly
+  highlight: breezedark
+  df_print: paged
+  
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.align = "center", warning = F, message = F)
+```
+
+```{r}
+knitr::include_graphics("image/intros.jfif")
+```
+
+# Library and Setup
+```{r message = FALSE}
+library(readr) # read data
+library(caTools) # split datasets
+library(dplyr) 
+library(forcats) # categorical variable
+library(bbplot) # plot theme by bbc
+library(ggplot2)
+library(ggthemes)
+library(InformationValue)
+library(corrplot)
+library(QuantPsyc)
+library(caret)
+library(randomForest)
+library(adabag)
+library(mice)
+```
+
+
+# Load and Inspect Data {.tabset .tabset-pills}
+The dataset is available on Kaggle website on this link: (https://www.kaggle.com/c/titanic)
+```{r message=FALSE, include= FALSE}
+train <- read_csv("data/train.csv") 
+test <- read_csv("data/test.csv")
+
+str(train)
+```
+
+**Variable Input**
+
+**Survival**: 0 = No, 1 = Yes
+
+**Pclass**: Ticket class (1 = 1st, 2 = 2nd, 3 = 3rd)
+
+**Sex**: Sex of the passenger (female/male)
+
+**Age**: Age in years (if the age is fractional, it is less than 1, if the age is estimated, it is in
+  the form of xx.5)
+
+**SibSp**: # of siblings (brother/sister/stepbrother/stepsister) or spouses (husband/wife) aboard
+
+**ParCh**: # of parents (mother/father) or children (daughter/son/stepdaughter/stepson) aboard
+
+**Ticket**: Ticket number
+
+**Fare**: Passenger fare
+
+**Cabin**: Cabin number
+
+**Embarked**: Port of Embarkation (C = Cherbourg, Q = Queenstown, S = Southampton)
+
+## Inspect Data
+```{r}
+dim(train) # 891 rows, 12 columns
+dim(test) # 418 rows, 11 columns
+```
+In this section, I will utilize the idea of feature engineering, basically try to create additional relevent features from the existing raw features in the data, and to increase the predictive power of the learning algorithms.
+
+## Merge dataset 
+Now, I merged the independent variables of training and test sets into a full data set, which is convenient for me to manipulate the data on both sets.
+```{r}
+full_data <- rbind(train[,-c(1,2)], test[,-1])
+
+summary(full_data)
+```
+# Data Manipulation {.tabset .tabset-pills}
+## PcClass
+Based on the description of the Data in Part2, Pclass is an ordered factor variable, therefore, I will transform it from a numeric variable to a categorical variable.
+```{r}
+full_data$Pclass <- factor(full_data$Pclass, 
+                                 levels = c("3", "2", "1"),
+                                 labels = c("3rd", "2nd", "1st"),
+                                 ordered = T)
+
+table(full_data$Pclass)
+```
+## Age
+```{r}
+full_data <- full_data %>%
+  mutate(Age_Category = case_when(
+    Age < 13 ~ "Child",
+    between(Age, 13, 18) ~ "Teenager",
+    between(Age, 19, 50) ~ "Adult",
+    Age > 50 ~ "Old"
+  ))
+```
+
+
+## Passenger
+Extract the title from name to support further analysis.
+```{r}
+full_data$Title <-  gsub("^.*, (.*?)\\..*$", "\\1", full_data$Name)
+table(full_data$Title)
+```
+Based on the result above, the `most frequent` variables are `“Master”, “Miss”, “Mr”, and “Mrs”`. Therefore, I will explore the observations with rare titles and check if I could `group them into the 4 most frequent titles`.
+```{r}
+full_data %>%
+            filter(!Title %in% c("Master", "Miss", "Mr", "Mrs")) %>%
+            select_all()%>%
+            arrange(Sex)
+```
+
+Categorise title and merge them back again into 4 big category
+```{r}
+full_data <- full_data %>%
+  mutate(Title = fct_collapse(Title,
+                              "Miss" = c("Miss", "Ms", "Lady", "Mlle", "Mme"),
+                              "Mr" = c("Mr", "Sir"),
+                              "Mrs" = "Mrs",
+                              "Master" = "Master",
+                              )) %>%
+  mutate(Title = fct_other(Title, keep = c("Miss", "Mr", "Mrs", "Master"), other_level = "Unordinary"))
+
+table(full_data$Title)
+```
+## FamilySize 
+Since `siblings, spouse, parents, children` all `express family size` information, I add a new categorical variable **FamilySize** to display this information.
+```{r}
+table(full_data$SibSp)
+```
+```{r}
+full_data <- full_data %>%
+              mutate(FamilySize = SibSp + Parch + 1,) %>%
+              mutate(FamilySize_Cat = case_when(
+              FamilySize == 1 ~ "Single",
+              between(FamilySize, 2, 4) ~ "Small",
+              FamilySize >= 5 ~ "Large"
+              )) %>%
+              mutate(FamilySize_Cat = fct_relevel(FamilySize_Cat, 
+              "Single", "Small", "Large"))
+
+table(full_data$FamilySize_Cat)
+```
+## TicketType 
+For Ticket variable, it’s similary as Name variable, meaning that we could not directly extract useful information from it. However, I found that `sometimes the ticket number only shows once, while other times, ticket numbers shows multiple times`. Therefore, I will `add a new categorical` variable named `**TicketType** that shows the frequency of the Ticket number.
+```{r message=FALSE}
+ticket.unique <- rep(0, nrow(full_data))
+tickets <- unique(full_data$Ticket) # list each unique the Ticket number 1 time
+
+for (i in 1:length(tickets)) {
+            current.ticket <- tickets[i]
+            party.indexes <- which(full_data$Ticket == current.ticket)
+
+for (k in 1:length(party.indexes)) {
+            ticket.unique[party.indexes[k]] <- length(party.indexes)
+            }
+}
+
+full_data <- full_data %>%
+              mutate(TicketGroup = ticket.unique,) %>%
+              mutate(TicketType = case_when(
+              TicketGroup == 1 ~ "Single",
+              between(TicketGroup, 2, 4) ~ "Small",
+              TicketGroup >= 5 ~ "Large"
+              )) %>%
+              mutate(TicketType = fct_relevel(TicketType, "Single", "Small", "Large"))
+
+table(full_data$TicketGroup)
+```
+```{r}
+table(full_data$TicketType)
+```
+# Data Cleaning {.tabset .tabset-pills}
+
+## Fill in Age
+```{r}
+set.seed(1234)
+mice.mod <- mice(full_data[, !names(full_data) %in% c("Name", "SibSp", "Parch", "Ticket", "Cabin")], method = "pmm")
+```
+
+```{r}
+mice.output <- complete(mice.mod)
+```
+Now, check the distribution of Age before and after the imputation. The two distributions are highly similar to each other, therefore, it’s an valid method to utilize.
+
+```{r}
+par(mfrow = c(1,2))
+hist(full_data$Age, freq = F, main = "Age: Original Data", 
+     col='skyblue', ylim=c(0,0.04))
+hist(mice.output$Age, freq = F, main = "Age: MICE Output", 
+     col='lightblue', ylim=c(0, 0.04))
+```
+
+Embed the data on `full_data-Age`
+```{r}
+par(mfrow=c(1,1))
+
+full_data$Age <- mice.output$Age
+
+colSums(is.na(full_data))
+```
+
+
+The idea of binning the Age variable is that I believe children and the old people are more likely to be saved, resulting higher survival rate.
+```{r}
+full_data <- full_data %>%
+              mutate(Age_Category = case_when(
+              Age <= 17 ~ "Child",
+              between(Age, 17, 18) ~ "Teenager",
+              between(Age, 19, 50) ~ "Adult",
+              Age > 50 ~ "Old"
+              )) 
+
+table(full_data$Age_Category)
+
+full_data %>% 
+  mutate(Age_Category=as.factor(Age_Category)) %>% 
+  group_by(Age_Category) %>% 
+  filter(Age_Category == "NA")
+
+colSums(is.na(full_data))
+```
+## Fill in Fare
+First, figure out the observation with missing value.
+```{r}
+full_data %>%
+  filter(is.na(Fare))
+```
+
+```{r}
+full_data %>%
+  group_by(Pclass, Embarked) %>%
+  summarise(median = median(Fare, na.rm = T)) %>% 
+  ungroup()
+
+colSums(is.na(full_data))
+```
+```{r}
+# visualization
+full_data %>%
+  filter(Pclass == "3rd", Embarked == "S") %>%
+  ggplot(aes(x = Fare)) + 
+  geom_density(fill = "skyblue", alpha = 0.4) +
+  geom_vline(aes(xintercept = median(Fare, na.rm =  T)), 
+             col = "red", linetype = 2, size = 0.5)
+```
+Based on plot, we have median around `8,05`
+```{r}
+# fill in  the missing value using median
+full_data$Fare[is.na(full_data$Fare)] <- 8.05
+```
+## Drop Cabin
+As we know, Cabin has 1014 missing values, meaning that more than 75% of the information was missed. Therefore, I simply deleted this variable.
+```{r}
+full_data$Cabin <- NULL
+
+colSums(is.na(full_data))
+```
+## Fill in Embarked
+First, figure out the observation with missing value.
+```{r}
+full_data %>%
+  filter(is.na(Embarked))
+```
+For these two observations, both of them were in the 1st class and their Fare prices were both 80.
+
+Then, show the table of median Fare values sliced by Pclass and Embarked again:
+```{r}
+full_data %>%
+  group_by(Pclass, Embarked) %>%
+  summarise(median = median(Fare, na.rm = T))
+```
+Based on the result, it’s not hard to find that the median Fare price of passengers Embarked on C and were in the 1st class is 76.7, which is quite similar to 80. Therefore, it’s safe to fill in the missing value of Embarked information as “C” as below.
+```{r}
+full_data$Embarked[which(is.na(full_data$Embarked))] <- 'C'
+table(full_data$Embarked) # double check
+```
+
+```{r}
+# there's an unused level, therefore, drop it as below:
+full_data$Embarked<- as.factor(full_data$Embarked)
+full_data$Embarked <- droplevels(full_data$Embarked)
+```
+
+## Finalising
+```{r}
+full_data <- full_data %>%
+  select_all()
+
+str(full_data)
+```
+
+## Summary
+**Summary**
+- As we can see we have most of NAs in `Cabin`. There are `too many missing variable`s so for this reason `we will not consider this column in our analysis`. We will also remove `PassengerID`, `Ticket`, and `Name` for our `train data`
+- We also have `263 age variables that are missing`. It is quite a lot as it is `more or less 20% of ages variables missing on the whole dataset`.In this simple data cleaning we will take the easy option of replacing NA variables by the median of the different datasets. `In a future analysis we will consider to attempt to predict the age with the other variables available`.
+- The `weakness of using the median to replace NA without considering other variables` to `predict the missing ages is that we have 20% of data on the median with is 27`.
+- We have `one NA data` in `Fare` missing in our test dataset. we will `filling in with the median of the data`.
+
+
+# Exploratory Data Analysis 
+
+## Split Data Train-Test
+Cleaned train and test data sets and perform EDA on the train dataset, because we only have the Survived information of the train dataset.
+```{r}
+train.clean <- cbind(train$Survived, full_data[1:891,])
+names(train.clean)[1] <- "Survived"
+train.clean$Survived <- as.factor(train.clean$Survived)
+
+test.clean <- full_data[892:1309,]
+```
+
+
+# Effect Independent on Dependent Variables 
+## PcClass
+```{r}
+train.clean %>%
+  ggplot(aes(x = Pclass, y = ..count.., fill = Survived)) +
+  geom_bar(stat = "count", position = "dodge") +
+  labs(x = "Ticket Class",
+       y = "Number of Passengers",
+       title = "Effect of Ticket Class on Survival Rate") +
+  theme_bw() + scale_fill_brewer(palette = "Pastel1") +
+  geom_text(stat = "count", 
+            aes(label = ..count..),
+            position=position_dodge(width = 1), 
+            vjust=-0.2)
+```
+
+**Summary**
+Based on the visualization, more than 50% the passengers in the 1st class survived, about 50% of the passengers in the 2nd class survived, while most of the passenger in the 3rd class did not survive.
+
+Next, calculate WOE and IV as below:
+```{r}
+# library(InformationValue)
+WOETable(X = train.clean$Pclass, Y = train.clean$Survived)
+```
+```{r}
+IV(X = train.clean$Pclass, Y = train.clean$Survived)
+```
+According to a `0.5 IV value`, and the `Highly Predictive` result, we could regard `Pclass` as one of the features that are `used to model the data`.
+
+## Passenger
+```{r}
+train.clean %>%
+  ggplot(aes(x = Title, y = ..count.., fill = Survived)) +
+  geom_bar(stat = "count", position = "stack") +
+  labs(x = "Titles",
+       y = "Number of Passengers",
+       title = "Effect of Titles on Survival Rate") +
+  theme_bw() + scale_fill_brewer(palette = "Accent") +
+  geom_text(stat = "count", 
+            aes(label = ..count..),
+            position = position_stack(vjust = 0.2))
+```
+
+**Summary**
+According to the plot, most of the passengers with the title of “Mr” did not survive, while passengers with the title of “Miss” and “Mrs” have higher survival rate.
+
+Next, calculate WOE and IV as below:
+```{r}
+WOETable(X = train.clean$Title, Y = train.clean$Survived)
+```
+```{r}
+IV(X = train.clean$Title, Y = train.clean$Survived)
+```
+The IV value is as `high as 1.52`, therefore, `we could regard Title as one of the features that are used to model the data`.
+
+## Sex
+
+Next, calculate WOE and IV as below:
+```{r}
+WOETable(X = as.factor(train.clean$Sex), Y = train.clean$Survived)
+```
+```{r}
+IV(X = as.factor(train.clean$Sex), Y = train.clean$Survived)
+```
+The IV value is as high as 1.34, therefore, we could regard Sex as one of the features that are used to model the data.
+
+```{r}
+train.clean %>%
+  ggplot(aes(x = Sex, y = ..count.., fill = Survived)) +
+  geom_bar(stat = "count", position = "dodge") +
+  labs(x = "Sex",
+       y = "Number of Passengers",
+       title = "Effect of Sex on Survival Rate") +
+  theme_bw() + scale_fill_brewer(palette = "Pastel2") +
+  geom_text(stat = "count", 
+            aes(label = ..count..),
+            position = position_dodge(width = 1), vjust = -0.5)
+```
+
+**Summary**
+According to the plot, female passengers are much morel likely to survive than male passengers.
+
+## Age
+First, perform WOE and IV analysis on both Age and Aged variable to decide which one to use.
+```{r}
+WOETable(X = as.factor(train.clean$Age), Y = train.clean$Survived)
+```
+```{r}
+IV(X = as.factor(train.clean$Age), Y = train.clean$Survived)
+```
+Based on the result, I will use the Age. Below is the visualization 
+```{r}
+train.clean %>%
+  ggplot(aes(x = Age, color = Survived)) +
+  geom_line(aes(label=..count..), stat = 'bin') +
+  labs(x = "Age",
+       y = "Number of Passengers",
+       title = "Effect of Age on Survival Rate") +
+  theme_bw() + scale_color_brewer(palette = "Set2") 
+```
+
+**Summary**
+From the plot, we could conclude that yound passengers have higher survival rate than old passengers.
+
+## FamilySize
+Again, utilize WOE and IV to select the variable first.
+
+SibSp
+```{r}
+WOETable(X = as.factor(train.clean$SibSp), Y = train.clean$Survived)
+```
+```{r}
+IV(X = as.factor(train.clean$SibSp), Y = train.clean$Survived)
+```
+
+Parch
+```{r}
+WOETable(X = as.factor(train.clean$Parch), Y = train.clean$Survived)
+```
+```{r}
+IV(X = as.factor(train.clean$Parch), Y = train.clean$Survived)
+```
+
+Family Size [combine:: SibSp + Parch]
+```{r}
+WOETable(X = as.factor(train.clean$FamilySize_Cat), Y = train.clean$Survived)
+```
+```{r}
+IV(X = as.factor(train.clean$FamilySize_Cat), Y = train.clean$Survived)
+```
+
+
+Visualization
+```{r}
+train.clean %>%
+  ggplot(aes(x = FamilySize_Cat, y =..count.., fill = Survived)) +
+  geom_bar(stat = "count", position = "dodge") + 
+  labs(x = "Family Size",
+       y = "Number of Passengers",
+       title = "Effect of Family Size on Survival Rate") +
+  theme_bw() + scale_fill_brewer(palette = "Set3") +
+  geom_text(stat = "count", 
+            aes(label = ..count..),
+            position = position_dodge(width = 1), vjust = -0.5)
+```
+
+**Summary**
+According to the plot, passengers with small family are the group with the highest survival rate.
+
+## TicketGroup and TicketTyped
+As before, apply WOE and IV to select the variable first.
+```{r}
+WOETable(X = as.factor(train.clean$TicketGroup), Y = train.clean$Survived)
+```
+```{r}
+IV(X = as.factor(train.clean$TicketGroup), Y = train.clean$Survived)
+```
+
+```{r}
+WOETable(X = train.clean$TicketType, Y = train.clean$Survived)
+```
+```{r}
+IV(X = train.clean$TicketType, Y = train.clean$Survived)
+```
+
+Based on the highest IV criteria, I will select TicketGroup here.
+```{r}
+train.clean %>%
+  ggplot(aes(x = TicketGroup, y = ..count.., fill = Survived)) +
+  geom_bar(stat = "count", position = "dodge") +
+  labs(x = "Ticket Group",
+       y = "Number of Passengers",
+       title = "Effect of Ticket Type on Survival Rate") +
+  theme_classic() + scale_fill_brewer(palette = "PuBu") +
+  scale_x_continuous(breaks = 1:11) +
+  geom_text(stat = "count", 
+            aes(label = ..count..),
+            position = position_dodge(width = 1), vjust = -0.5)
+```
+
+**Summary**
+Based on the result, passengers with ticket group of 2,3,4 have the highest survival rate.
+
+## Fare
+```{r}
+train.clean %>%
+  ggplot(aes(x = Fare, color = Survived)) +
+  geom_line(aes(label=..count..), stat = 'bin') +
+  labs(x = "Fare Price",
+       y = "Number of Passengers",
+       title = "Effect of Fare Price on Survival Rate") +
+  theme_classic() + scale_color_brewer(palette = "Set1") 
+```
+
+**Summary**
+Accordingly, when the price is below 200 dollars, the higher the fare price is, the higher the survival rate it, when the price is higher than 200 dollars, there isn’t significant difference.
+
+
+## Embarked
+```{r}
+train.clean %>%
+  ggplot(aes(x = Embarked, y = ..count.., fill = Survived)) +
+  geom_bar(stat = "count", position = "dodge") +
+  labs(x = "Embarked Place",
+       y = "Number of Passengers",
+       title = "Effect of Embarked Place on Survival Rate") +
+  theme_classic() + scale_fill_brewer(palette = "RedGs") +
+  geom_text(stat = "count", 
+            aes(label = ..count..),
+            position = position_dodge(width = 1), vjust = -0.5)
+```
+**Summary**
+Based on the plot, the survival rate for passengers embarked on C is the highest, while the survival rate for passengers embarked on S is the lowest.
+```{r}
+WOETable(X = train.clean$Embarked, Y = train.clean$Survived)
+```
+```{r}
+IV(X = train.clean$Embarked, Y = train.clean$Survived)
+```
+
+Accordingly, Embarked could be regarded as one of the features used to predict the survival because of the high IV value.
+
+To sum up, I will use `Pclass, Title, Sex, Age_Cat, FamilySize_Cat, TicketGroup, Fare, and Embarked` as predictors.
+```{r}
+train.final <- train.clean %>%
+  select_all()
+
+test.final <- test.clean %>%
+  select_all()
+
+colSums(is.na(train.final))
+colSums(is.na(test.final))
+
+```
+
+# Correlations Numeric Independent Variables
+```{r}
+train.final %>%
+  select_if(is.numeric) %>%
+  cor() %>%
+  corrplot.mixed()
+```
+
+# Build Class Model {.tabset .tabset-pills}
+I will utilize 6 classification methods : 
+- **Stepwise Logistic Regression Model**
+- **k-Nearest-Neighbors (KNN)**
+- **Naive Bayes Classifier**
+- **Random Forest Model**
+
+## Logistic Regression 
+```{r}
+titanic.null <- glm(Survived ~ 1, data = train.final, family = 'binomial')
+titanic.full <- glm(Survived ~ ., data = train.final, family = 'binomial')
+titanic.step <- step(titanic.null, scope = list(lower = titanic.null, upper = full_data),
+                     direction = "both")
+```
+
+```{r}
+summary(titanic.step)
+```
+
+```{r}
+ClassLog(titanic.step, train.final$Survived, cut = .5)
+```
+
+```{r}
+predicted <- plogis(predict(titanic.step, train.final))
+plotROC(train.final$Survived, predicted)
+```
+
+Check the optimal cutoff value, and use it to build the classification table again:
+
+```{r}
+(optCutOff <- optimalCutoff(train.final$Survived, predicted))
+```
+
+```{r}
+ClassLog(titanic.step, train.final$Survived, cut = .65)
+```
+
+Predict on the test data:
+```{r}
+pred.logistic <- predict(titanic.step, test.final, type = "response")
+pred.logistic <- ifelse(pred.logistic > 0.65, 1, 0)
+```
+
+## Random Forest
+```{r}
+set.seed(1)
+titanicRF <- randomForest(Survived ~., data = train.final)
+confusionMatrix(titanicRF$predicted, train.final$Survived,positive = "1")
+```
+
+Predict on the test data:
+```{r}
+pred.rf <- predict(titanicRF, test.final, type = "response")
+```
+
+
+# Prediction Accuracy
+**Summary**
+1. Logistic Regression - 0.7751 
+2. Accuracy with Random Forest - 0.7895 
+
+# Summary
+```{r}
+knitr::include_graphics("image/intro.jfif")
+```
+The Bagging model generates the highest accuracy with Random Forest score of 0.7895. Besides, for this specific task, there are still many other algorithms that could be utilized to make prediction but I will not discuss more details here.
+
+
